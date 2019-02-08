@@ -1,0 +1,207 @@
+---
+title: "Sta 523 - Homework 6"
+author: [Your names here]
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+### Setup
+
+```{r message=FALSE}
+# Load any necessary packages here
+library(sf)
+library(dplyr)
+library(ggplot2)
+library(readr)
+library(stringr)
+```
+
+### Task 1 - Clean and Merge Data
+
+#### Parking Violation Data
+
+```{r message=FALSE}
+if (!file.exists("nyc_parking.Rdata")) {
+  nyc_raw = read_csv("/data/nyc_parking/NYParkingViolations.csv") 
+  
+  nyc = nyc_raw %>%
+    setNames(str_replace_all(names(.)," ", "_")) %>%
+    select(Violation_Precinct, House_Number, Street_Name) %>%
+    transmute(precinct = Violation_Precinct, address = paste(House_Number, Street_Name)) %>%
+    filter(address != "") %>%
+    filter(precinct <= 34)
+  
+  save(nyc, file="nyc_parking.Rdata")
+} else {
+  load(file="nyc_parking.Rdata")
+}
+```
+
+For this part (Parking Violation Data), we read in the `nyc_parking` data, select variables that we are interested in and only choose precincts that belong to Manhattan. The result is a dataframe containing the street addresses and their corresponding precinct number.
+
+#### Geocoding Data
+
+```{r warning=FALSE}
+pluto = st_read("/data/nyc_parking/pluto_manhattan/MNMapPLUTO.shp", quiet=TRUE, stringsAsFactors = FALSE) 
+
+pluto = pluto %>%
+  st_geometry() %>%
+  st_centroid() %>%
+  st_coordinates() %>% 
+  data.frame(address = pluto$Address, ., stringsAsFactors = FALSE) %>%
+  tbl_df() %>%
+  filter(!is.na(address))
+```
+
+For this part (Geocoding Data), we read in the shapefile and geocode the data using the `sf` package, so the result we get is a dataframe containing the street addresses and their corresponding coordinates.
+
+#### Clean and merge data
+
+## Need further cleaning
+```{r}
+nyc_clean = nyc %>% 
+  mutate( address = toupper(address),
+    address = str_replace_all(address, 
+                                   c("(?<=\\b)W(?<=\\b)" = "WEST", 
+                                     "(?<=\\b)E(?<=\\b)" = "EAST",
+                                     "(?<=\\b)S(?<=\\b)" = "SOUTH",
+                                     "(?<=\\b)N(?<=\\b)" = "NORTH",
+                                     "(?<=\\b)ST(?<=\\b)" = "STREET",
+                                     "(?<=\\b)(AVE|AV)(?<=\\b)" = "AVENUE",
+                                     "(?<=\\b)PL(?<=\\b)" = "PLACE",
+                                     "(?<=\\b)PLZ(?<=\\b)" = "PLAZA",
+                                     "(?<=\\b)RD(?<=\\b)" = "ROAD",
+                                     "(?<=\\b)DR(?<=\\b)" = "DRIVE",
+                                     "(?<=\\b)SQ(?<=\\b)" = "SQUARE",
+                                     "(?<=\\b)(LA|LN)(?<=\\b)" = "LANE",
+                                     "(?<=\\b)TER(?<=\\b)" = "TERRACE",
+                                     "(?<=\\d)(ST|ND|RD|TH)\\b" = "",
+                                     "ADAM CLAYTON POWELL$" = "ADAM C POWELL BLVD",
+                                     "(?<=(MADISON|LEXINGTON))$" = " AVENUE")) %>% 
+           str_replace_all(c("(?<=\\d{1,4}\\s\\d{1,4})$" = " AVENUE",
+                             "(?<=\\d{1,4}\\s[A-Z]{4,5}\\s\\d{1,4})$" = " STREET",
+                             "(?<=\\b)(BL|BLV|BLVD)(?<=\\b)" = "BOULEVARD"))) 
+pluto = pluto %>% 
+  mutate(address = str_replace_all(address, "(?<=\\b)(BL|BLV|BLVD)(?<=\\b)", "BOULEVARD"))
+
+d = inner_join(
+  mutate(nyc_clean, address=tolower(address)), 
+  mutate(pluto, address=tolower(address)),
+  by="address"
+)
+
+manh_precincts = c(1,5,6,7,9,10,13,14,17,18,19,20,22,23,24,25,26,28,30,32,33,34)
+
+d = filter(d, precinct %in% manh_precincts)
+
+max = d %>% group_by(address, precinct) %>% 
+  summarize(n = n()) %>% group_by(address) %>% 
+  slice(which.min(n)) #%>% summarize(m = n()) %>% arrange(desc(m))
+
+multi = d %>% group_by(address) %>%
+  summarise(n = length(unique(precinct))) %>% filter(n>1)
+
+for(i in unique((multi$address))){
+  ind <- which(d$address==i)
+  d[ind,]$precinct <- max$precinct[max$address==i]
+}
+```
+
+For this part (Clean and merge data), since the goal is to merge two dataframes, `nyc` and `pluto`, by `address`, we first clean the `nyc` dataframe so that the format of its `address` can match that of `pluto` as much as possible. Then we use `inner_join` to merge these dataframes. And since precinct numbers are just a subset of integer 1 through 34, we filter `precinct` according to those specific numbers to obtain the final dataframe, `d`, that we will work on later, which contains `precinct`, `address` and their corresponding coordinates.
+
+We also found a pattern in the `address` in raw datasets. We found that number+orientation in addresses are usually followed by 'street', while number only are usually followed by `avenue`
+There are many rows in the dataset that have different precincts for same addresses, which may due to wrong initial records. In order to have a more consistent dataset, we run a `for loop` to assign only one precinct, which is the precint most of that addresses have, to all the same addresses.
+
+## Task 2 - Modeling
+
+### Setup
+
+```{r}
+library(parallel)
+
+if (!file.exists("manh.Rdata")) {
+    
+  manh = st_read("/data/nyc_parking/nybb/nybb.shp", quiet=TRUE) %>%
+    filter(BoroName == "Manhattan")
+  
+  bbox = st_bbox(manh)
+  
+  X = seq(bbox["xmin"], bbox["xmax"], 0.00075)
+  Y = seq(bbox["ymin"], bbox["ymax"], 0.00075)
+  
+  grid = expand.grid(X=X, Y=Y) %>% 
+    as.matrix() %>%
+    st_multipoint() %>%
+    st_sfc() %>%
+    st_set_crs(st_crs(manh))
+      
+  manh_pts = st_intersection(st_geometry(manh), grid) %>% st_cast("POINT")
+   
+  manh_xy = st_coordinates(manh_pts) %>% as.data.frame()
+  
+  save(manh, manh_pts, manh_xy, file="manh.Rdata")
+} else {
+  load("manh.Rdata")
+}
+```
+
+
+
+### xgboost
+
+```{r}
+library(xgboost)
+
+d_xg = d %>% select(-address) %>% mutate(precinct = as.factor(precinct))
+
+precincts = d_xg$precinct %>% levels()
+y = (d_xg$precinct %>% as.integer()) - 1L
+x = d_xg %>% select(X,Y) %>% as.matrix()
+set.seed(23333)
+index <- sample(1:length(y),0.7*length(y),replace = F)
+x_train <- x[index,]
+y_train <- y[index]
+x_test <- x[-index,]
+y_test <- y[-index]
+dtrain <- xgb.DMatrix(data = x_train, label=y_train)
+dtest <- xgb.DMatrix(data = x_test, label=y_test)
+watchlist <- list(train=dtrain, test=dtest)
+m = xgb.train(data=dtrain, nthread = 4, nrounds=200, watchlist=watchlist, objective = "multi:softmax",num_class=length(precincts),verbose = 1)
+#m = xgboost(data=dtrain, nthread=4, nround=50, objective="multi:softmax", num_class=length(precincts),verbose = 1)
+
+p_index = predict(m, newdata=as.matrix(manh_xy))
+precinct_pred = precincts[p_index+1L] %>% as.character() %>% as.integer()
+
+pred_df = cbind(manh_xy, precinct=precinct_pred)
+
+pred_sf = st_sf(precinct = precinct_pred, geometry = manh_pts)
+
+
+pred_sf_mp = pred_sf %>%
+  group_by(precinct) %>%
+  summarize(geometry = list(st_cast(geometry,"MULTIPOINT")))
+
+pred_boundary = pred_sf_mp %>% st_buffer(0.00075) %>% st_buffer(-0.0005) 
+  
+  #st_intersection(st_geometry(manh))
+
+# devtools::install_github("tidyverse/ggplot2")
+ggplot() +
+  geom_sf(data=pred_boundary, aes(fill=precinct), alpha=0.3)
+
+st_write(pred_boundary, "precincts.geojson", delete_dsn = TRUE, quiet=TRUE)
+```
+
+
+There are two models that we've tried, one randomforest and one xgb.train. Our final model is xgb.train, so the code for randomForest above is not run. 
+
+Given the cleaned data by task1, we used the `expand.grid()` function to obtain a comprehensive geo data grid that covers Manhattan as much as possible. We splited the dataset into training (70%) and testing (30%) partitions, which were later used for cross-validation. Then we use `xgb.train` to find the best tree model based on the training dataset. 
+
+We've tried multiple possible values `nrounds` ranging from 50 to 250, and the optimal value for performance is close to 200. We found that if the number of rounds is too large, the model failed for certain precincts.
+
+We used the same cross-validation methods on randomForest model, which failed to classify certain precincts due to limited data.
